@@ -1,6 +1,9 @@
 package utp
 
-import "time"
+import (
+	"sync"
+	"time"
+)
 
 const (
 	curDelaySize     = 3
@@ -21,27 +24,27 @@ type hist struct {
 	delayBaseTime time.Time
 }
 
-func (h *hist) Initialize(sample uint32) {
-	h.curDelay = make([]uint32, curDelaySize)
+func (h *hist) Initialize() {
+	h.curDelayHist = make([]uint32, curDelaySize)
 	h.delayBaseHist = make([]uint32, delayBaseSamples)
-	h.delayBase = sample
 	h.delayBaseTime = time.Now()
+	h.delayBase = ticksSince(h.delayBaseTime)
 	for i := range h.delayBaseHist {
-		h.delayBaseHist[i] = sample
+		h.delayBaseHist[i] = h.delayBase
 	}
 }
 
 func (h *hist) Shift(off uint32) {
-	for i := range baseDelayHist {
-		baseDelayHist[i] += shift
+	for i := range h.delayBaseHist {
+		h.delayBaseHist[i] += off
 	}
-	baseDelay += off
+	h.delayBase += off
 }
 
 func (h *hist) Add(sample uint32) {
 	cur := time.Now()
 	if wrapCmp(sample, h.delayBaseHist[h.delayBaseIdx], timestampMask) {
-		h.delayBaseHist[delayBaseIdx] = sample
+		h.delayBaseHist[h.delayBaseIdx] = sample
 	}
 	if wrapCmp(sample, h.delayBase, timestampMask) {
 		h.delayBase = sample
@@ -66,51 +69,15 @@ func (h *hist) Add(sample uint32) {
 }
 
 func (h *hist) Get() uint32 {
-	v := uint32(-1)
+	v := ^uint32(0)
 	for _, x := range h.curDelayHist {
 		v = minU32(v, x)
 	}
 	return v
 }
 
-type packetBuf struct {
-	mask uint
-	// yay pointers >_>
-	pkt *[]*packet
-}
-
-func (p *packetBuf) Get(idx uint) *packet {
-	return p.pkt[idx&mask]
-}
-
-func (p *packetBuf) Put(idx uint, d *packet) {
-	p.pkt[idx&mask] = d
-}
-
-func (p *packetBuf) Grow(item, idx uint) {
-	sz := mask + 1
-	sz *= 2
-	for idx < sz {
-		sz *= 2
-	}
-	n := make([][]byte, sz)
-	sz--
-	for i := 0; i <= p.mask; i++ {
-		n[(item-idx+i)&sz] = p.get(item - idx + i)
-	}
-	p.mask = sz
-	p.pkt = &n
-}
-
-func (p *packetBuf) Ensure(item, idx, uint) {
-	if idx > p.mask {
-		p.Grow(item, idx)
-	}
-}
-
-func (p *packetBuf) Size() uint { return p + 1 }
-
 type packet struct {
+	*sync.RWMutex
 	Tx         int
 	Header     *header
 	Payload    []byte
@@ -120,4 +87,9 @@ type packet struct {
 
 func (p *packet) Len() int {
 	return p.Header.Len() + len(p.Payload)
+}
+
+// Bytes serializes the header and payload and returns a byte slice of it
+func (p *packet) Bytes() []byte {
+	return nil
 }
