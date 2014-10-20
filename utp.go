@@ -27,6 +27,10 @@ func (h *header) Len() int {
 	return 20 + len(h.ExData)
 }
 
+func (h *header) Type() uint8 {
+	return h.VerType & 0x0f
+}
+
 func (h *header) Ser(b []byte) {
 	b[0] = h.VerType
 	if h.Ex {
@@ -84,8 +88,18 @@ var (
 
 // a *Conn satisfies the net.Conn interface
 type Conn struct {
-	c    net.PacketConn
-	prng *mrand.Rand
+	c          net.PacketConn
+	prng       *mrand.Rand
+	destroy    chan struct{}
+	remoteAddr net.Addr
+
+	// timing information
+	curTime time.Time
+	// time we last maxed the window
+	lastMaxed     time.Time
+	lastRecvd     time.Time
+	lastSent      time.Time
+	lastRWinDecay time.Time
 
 	// Number of packets in send queue (unsent and needing resend)
 	// Oldest unacked packet is (seq - curWinPkts)
@@ -103,8 +117,6 @@ type Conn struct {
 	seqNum uint16
 	// packets recieved, inclusive
 	ackNum uint16
-	// time we last maxed the window
-	lastMaxed time.Time
 	// IDs
 	recvID, sendID uint16
 	// last window size we advertised
@@ -151,12 +163,14 @@ func Dial(address string) (*Conn, error) {
 	return c, nil
 }
 
-func newConn(u net.PacketConn) (*Conn, error) {
+func newConn(u *net.UDPConn) (*Conn, error) {
 	c := Conn{c: u}
 	c.state = csIdle
 	c.stateCond = sync.NewCond(&sync.Mutex{})
 	b := make([]byte, 8)
 	io.ReadFull(rand.Reader, b)
+	c.remoteAddr = u.RemoteAddr()
+	c.destroy = make(chan struct{})
 	c.packets = make(map[uint16]*packet)
 	c.prng = mrand.New(mrand.NewSource(int64(binary.BigEndian.Uint64(b))))
 	// these use a random-ish large number, since it can't be unbounded
@@ -167,7 +181,7 @@ func newConn(u net.PacketConn) (*Conn, error) {
 	c.curTime = time.Now()
 	c.lastRecvd = c.curTime
 	c.lastSent = c.curTime
-	c.lastRWinDecay = c.curTime.Sub(maxWindowDecay)
+	c.lastRWinDecay = c.curTime.Add(-maxWindowDecay)
 
 	c.ourHist = &hist{}
 	c.theirHist = &hist{}
@@ -177,7 +191,6 @@ func newConn(u net.PacketConn) (*Conn, error) {
 }
 
 func (c *Conn) connect() error {
-	b := make([]byte, 20)
 	c.seqNum = uint16(c.prng.Uint32() >> 16)
 
 	p := &packet{
@@ -245,7 +258,7 @@ func (c *Conn) run() {
 	MainLoop:
 		for {
 			select {
-			case <-c.close:
+			case <-c.destroy:
 				return
 			default:
 			}
@@ -258,12 +271,12 @@ func (c *Conn) run() {
 				debug("ReadFrom error:", err)
 				continue
 			}
-			if from.String() != c.remoteAddr {
+			if from != c.remoteAddr {
 				debug("martian packet:", from)
 				continue
 			}
 			h.Deser(buf)
-			switch h.Type {
+			switch h.Type() {
 			case Data:
 				// queue up an ack
 				// queue up resends
@@ -289,7 +302,7 @@ func (c *Conn) run() {
 					c.stateChange(csConnected)
 				}
 			case Reset:
-				c.(net.PacketConn).Close()
+				c.c.Close()
 				c.stateChange(csReset)
 				return
 			case Syn:
@@ -302,31 +315,40 @@ func (c *Conn) stateChange(s connState) {
 	c.stateCond.L.Lock()
 	c.state = s
 	if s == csReset {
-		close(c.close)
+		close(c.destroy)
 	}
 	c.stateCond.L.Unlock()
 	c.stateCond.Broadcast()
 }
 
 func (c *Conn) Read(b []byte) (int, error) {
+	return 0, nil
 }
 
 func (c *Conn) Write(b []byte) (int, error) {
+	return 0, nil
 }
 
 func (c *Conn) Close() error {
+	return nil
 }
 
 func (c *Conn) LocalAddr() net.Addr {
-	return c.(*net.UDPConn).LocalAddr()
+	return c.c.LocalAddr()
 }
 
 func (c *Conn) RemoteAddr() net.Addr {
-	return c.(*net.UDPConn).RemoteAddr()
+	return c.remoteAddr
 }
 
-func (c *Conn) SetDeadline(t time.Time) error {}
+func (c *Conn) SetDeadline(t time.Time) error {
+	return c.c.SetDeadline(t)
+}
 
-func (c *Conn) SetReadDeadline(t time.Time) error {}
+func (c *Conn) SetReadDeadline(t time.Time) error {
+	return c.c.SetReadDeadline(t)
+}
 
-func (c *Conn) SetWriteDeadline(t time.Time) error {}
+func (c *Conn) SetWriteDeadline(t time.Time) error {
+	return c.c.SetWriteDeadline(t)
+}
