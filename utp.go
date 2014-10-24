@@ -4,6 +4,7 @@ package utp
 import (
 	"crypto/rand"
 	"encoding/binary"
+	"fmt"
 	"io"
 	mrand "math/rand"
 	"net"
@@ -23,6 +24,13 @@ type header struct {
 	ExData   []byte
 }
 
+var (
+	errTooSmall       = fmt.Errorf("[]byte too small to (de)serialize")
+	errInvalidVersion = fmt.Errorf("version number unsupported")
+	// Returned when the Conn is closed for writing
+	ErrClosed = fmt.Errorf("utp: connection closed for writing")
+)
+
 func (h *header) Len() int {
 	return 20 + len(h.ExData)
 }
@@ -31,28 +39,39 @@ func (h *header) Type() uint8 {
 	return h.VerType & 0x0f
 }
 
-func (h *header) Ser(b []byte) {
+func (h *header) Ser(b []byte) error {
+	if cap(b) < 20 {
+		return errTooSmall
+	}
 	b[0] = h.VerType
 	if h.Ex {
 		b[1] = 1
 	}
-	binary.BigEndian.PutUint16(b[2:3], h.ConnID)
-	binary.BigEndian.PutUint32(b[4:7], h.Ts)
-	binary.BigEndian.PutUint32(b[8:11], h.TsDelta)
-	binary.BigEndian.PutUint32(b[12:15], h.WindowSz)
-	binary.BigEndian.PutUint16(b[16:17], h.SeqNum)
-	binary.BigEndian.PutUint16(b[18:19], h.AckNum)
+	binary.BigEndian.PutUint16(b[2:4], h.ConnID)
+	binary.BigEndian.PutUint32(b[4:8], h.Ts)
+	binary.BigEndian.PutUint32(b[8:12], h.TsDelta)
+	binary.BigEndian.PutUint32(b[12:16], h.WindowSz)
+	binary.BigEndian.PutUint16(b[16:18], h.SeqNum)
+	binary.BigEndian.PutUint16(b[18:20], h.AckNum)
+	return nil
 }
 
-func (h *header) Deser(b []byte) {
+func (h *header) Deser(b []byte) error {
+	if len(b) < 20 {
+		return errTooSmall
+	}
+	if (b[0] >> 4) != 1 {
+		return errInvalidVersion
+	}
 	h.VerType = uint8(b[0])
 	h.Ex = (uint8(b[1]) != 0)
-	h.ConnID = binary.BigEndian.Uint16(b[2:3])
-	h.Ts = binary.BigEndian.Uint32(b[4:7])
-	h.TsDelta = binary.BigEndian.Uint32(b[8:11])
-	h.WindowSz = binary.BigEndian.Uint32(b[12:15])
-	h.SeqNum = binary.BigEndian.Uint16(b[16:17])
-	h.AckNum = binary.BigEndian.Uint16(b[18:19])
+	h.ConnID = binary.BigEndian.Uint16(b[2:4])
+	h.Ts = binary.BigEndian.Uint32(b[4:8])
+	h.TsDelta = binary.BigEndian.Uint32(b[8:12])
+	h.WindowSz = binary.BigEndian.Uint32(b[12:16])
+	h.SeqNum = binary.BigEndian.Uint16(b[16:18])
+	h.AckNum = binary.BigEndian.Uint16(b[18:20])
+	return nil
 }
 
 const (
@@ -88,10 +107,14 @@ var (
 
 // a *Conn satisfies the net.Conn interface
 type Conn struct {
-	c          net.PacketConn
-	prng       *mrand.Rand
+	c    net.PacketConn
+	prng *mrand.Rand
+	// Closing this channel is the last thing that should be done in Conn
+	// teardown, because it signals queue processing loops to exit.
 	destroy    chan struct{}
 	remoteAddr net.Addr
+	// if true, disallow writes but hang around for outstanding acks
+	closing bool
 
 	// timing information
 	curTime time.Time
@@ -117,6 +140,8 @@ type Conn struct {
 	seqNum uint16
 	// packets recieved, inclusive
 	ackNum uint16
+	// last packet we will recieve
+	eofNum uint16
 	// IDs
 	recvID, sendID uint16
 	// last window size we advertised
@@ -326,10 +351,22 @@ func (c *Conn) Read(b []byte) (int, error) {
 }
 
 func (c *Conn) Write(b []byte) (int, error) {
+	if c.closing {
+		return 0, ErrClosed
+	}
 	return 0, nil
 }
 
+// Close flushes pending write data and waits for the underlying connection to
+// shut down.
 func (c *Conn) Close() error {
+	c.stateCond.L.Lock()
+	c.state = csDestroy
+	for c.state != csIdle {
+		c.stateCond.Wait()
+	}
+	c.stateCond.L.Unlock()
+	close(c.destroy)
 	return nil
 }
 
